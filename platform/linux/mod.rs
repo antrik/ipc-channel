@@ -125,7 +125,7 @@ impl UnixSender {
 
     pub fn send(&self,
                 data: &[u8],
-                channels: Vec<UnixChannel>,
+                mut channels: Vec<UnixChannel>,
                 shared_memory_regions: Vec<UnixSharedMemory>)
                 -> Result<(),UnixError> {
         let mut data_buffer = vec![0; data.len() + mem::size_of::<u32>() * 2];
@@ -137,57 +137,62 @@ impl UnixSender {
         }
 
         unsafe {
-            let cmsg_length =
-                (channels.len() + shared_memory_regions.len()) * mem::size_of::<c_int>();
-            let cmsg_buffer = libc::malloc(CMSG_SPACE(cmsg_length as size_t)) as *mut cmsghdr;
-            (*cmsg_buffer).cmsg_len = CMSG_LEN(cmsg_length as size_t);
-            (*cmsg_buffer).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg_buffer).cmsg_type = SCM_RIGHTS;
+            let construct_header = |channels: &Vec<UnixChannel>, data_buffer: &Vec<u8>| {
+                let cmsg_length =
+                    (channels.len() + shared_memory_regions.len()) * mem::size_of::<c_int>();
+                let cmsg_buffer = libc::malloc(CMSG_SPACE(cmsg_length as size_t)) as *mut cmsghdr;
+                (*cmsg_buffer).cmsg_len = CMSG_LEN(cmsg_length as size_t);
+                (*cmsg_buffer).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg_buffer).cmsg_type = SCM_RIGHTS;
 
-            let mut fds = Vec::new();
-            for channel in channels.iter() {
-                fds.push(channel.fd());
-            }
-            for shared_memory_region in shared_memory_regions.iter() {
-                fds.push(shared_memory_region.fd);
-            }
-            ptr::copy_nonoverlapping(fds.as_ptr(),
-                                     cmsg_buffer.offset(1) as *mut _ as *mut c_int,
-                                     fds.len());
-            let mut cmsg_padding_ptr =
-                (cmsg_buffer.offset(1) as *mut _ as *mut c_int).offset(fds.len() as isize);
-            let cmsg_end =
-                (cmsg_buffer as *mut _ as *mut u8).offset(CMSG_SPACE(cmsg_length as size_t) as
-                                                          isize);
-            while (cmsg_padding_ptr as *mut u8) < cmsg_end {
-                *cmsg_padding_ptr = *DEV_NULL;
-                cmsg_padding_ptr = cmsg_padding_ptr.offset(1);
-            }
+                let mut fds = Vec::new();
+                for channel in channels.iter() {
+                    fds.push(channel.fd());
+                }
+                for shared_memory_region in shared_memory_regions.iter() {
+                    fds.push(shared_memory_region.fd);
+                }
+                ptr::copy_nonoverlapping(fds.as_ptr(),
+                                         cmsg_buffer.offset(1) as *mut _ as *mut c_int,
+                                         fds.len());
+                let mut cmsg_padding_ptr =
+                    (cmsg_buffer.offset(1) as *mut _ as *mut c_int).offset(fds.len() as isize);
+                let cmsg_end =
+                    (cmsg_buffer as *mut _ as *mut u8).offset(CMSG_SPACE(cmsg_length as size_t) as
+                                                              isize);
+                while (cmsg_padding_ptr as *mut u8) < cmsg_end {
+                    *cmsg_padding_ptr = *DEV_NULL;
+                    cmsg_padding_ptr = cmsg_padding_ptr.offset(1);
+                }
 
-            let mut iovec = iovec {
-                iov_base: data_buffer.as_ptr() as *const c_char as *mut c_char,
-                iov_len: data_buffer.len() as size_t,
+                let mut iovec = Box::new(iovec {
+                    iov_base: data_buffer.as_ptr() as *const c_char as *mut c_char,
+                    iov_len: data_buffer.len() as size_t,
+                });
+
+                let msghdr = msghdr {
+                    msg_name: ptr::null_mut(),
+                    msg_namelen: 0,
+                    msg_iov: &mut *iovec,
+                    msg_iovlen: 1,
+                    msg_control: cmsg_buffer as *mut c_void,
+                    msg_controllen: CMSG_SPACE(cmsg_length as size_t),
+                    msg_flags: 0,
+                };
+
+                (msghdr, iovec) // iovec returned to prevent premature dropping
             };
 
-            let msghdr = msghdr {
-                msg_name: ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: &mut iovec,
-                msg_iovlen: 1,
-                msg_control: cmsg_buffer as *mut c_void,
-                msg_controllen: CMSG_SPACE(cmsg_length as size_t),
-                msg_flags: 0,
-            };
+            let (msghdr, _iovec) = construct_header(&channels, &data_buffer);
 
             let result = sendmsg(self.fd, &msghdr, 0);
+            libc::free(msghdr.msg_control);
 
             if result > 0 {
-                libc::free(cmsg_buffer as *mut c_void);
                 return Ok(())
             } else {
                 let error = UnixError::last();
                 if error.0 != libc::EMSGSIZE {
-                    libc::free(cmsg_buffer as *mut c_void);
                     return Err(error)
                 }
             }
@@ -202,8 +207,13 @@ impl UnixSender {
                           &mut maximum_send_size_len as *mut socklen_t) < 0 {
                 return Err(UnixError::last())
             }
+
+            let (side_tx, side_rx) = try!(channel());
+            channels.push(UnixChannel::Receiver(side_rx));
+            let (msghdr, _iovec) = construct_header(&channels, &data_buffer);
+
             let bytes_per_fragment = maximum_send_size - (mem::size_of::<u32>() * 2 +
-                CMSG_SPACE(cmsg_length as size_t) as usize + 256);
+                msghdr.msg_controllen as usize + 256);
 
             // Split up the packet into fragments.
             let mut byte_position = 0;
@@ -229,20 +239,20 @@ impl UnixSender {
 
                     // Better reset this in case `data_buffer` moved around -- iterator
                     // invalidation!
-                    iovec.iov_base = data_buffer.as_ptr() as *const c_char as *mut c_char;
-                    iovec.iov_len = bytes_to_send as size_t;
+                    (*msghdr.msg_iov).iov_base = data_buffer.as_ptr() as *const c_char as *mut c_char;
+                    (*msghdr.msg_iov).iov_len = bytes_to_send as size_t;
 
                     sendmsg(self.fd, &msghdr, 0)
                 } else {
                     // Trailing fragment.
-                    libc::send(self.fd,
+                    libc::send(side_tx.fd,
                                data_buffer.as_ptr() as *const c_void,
                                bytes_to_send as size_t,
                                0)
                 };
 
                 if result <= 0 {
-                    libc::free(cmsg_buffer as *mut c_void);
+                    libc::free(msghdr.msg_control);
                     return Err(UnixError::last())
                 }
 
@@ -250,7 +260,7 @@ impl UnixSender {
                 this_fragment_id = next_fragment_id;
             }
 
-            libc::free(cmsg_buffer as *mut c_void);
+            libc::free(msghdr.msg_control);
             Ok(())
         }
     }
@@ -692,18 +702,14 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
         }
 
         // Reassemble fragments.
-        let mut leftover_fragments = Vec::new();
+        let side_rx = channels.pop().unwrap().to_receiver();
         while next_fragment_id != 0 {
             let mut cmsg = UnixCmsg::new(maximum_recv_size);
-            let bytes_read = try!(cmsg.recv(fd, blocking_mode)) as usize;
+            let bytes_read = try!(cmsg.recv(side_rx.fd, blocking_mode)) as usize;
 
             let this_fragment_id =
                 (&cmsg.data_buffer[0..mem::size_of::<u32>()]).read_u32::<LittleEndian>().unwrap();
-            if this_fragment_id != next_fragment_id {
-                // Not the fragment we're looking for. Save it and continue.
-                leftover_fragments.push(cmsg);
-                continue
-            }
+            assert!(this_fragment_id == next_fragment_id);
 
             // OK, it's the next fragment in the chain. Store its data.
             next_fragment_id =
@@ -712,17 +718,6 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
                                                                 .unwrap();
             main_data_buffer.extend(
                     cmsg.data_buffer[(mem::size_of::<u32>() * 2)..bytes_read].iter().cloned())
-        }
-
-        // Push back any leftovers. Do this in a separate thread to avoid deadlocks (e.g. #34).
-        if !leftover_fragments.is_empty() {
-            let fd_for_helper_thread = libc::dup(fd);
-            thread::spawn(move || {
-                for mut leftover_fragment in leftover_fragments.into_iter() {
-                    drop(leftover_fragment.send(fd_for_helper_thread));
-                }
-                libc::close(fd_for_helper_thread);
-            });
         }
 
         Ok((main_data_buffer, channels, shared_memory_regions))
