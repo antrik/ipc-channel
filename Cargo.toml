@@ -19,3 +19,6 @@ libc = "0.2"
 rand = "0.3"
 serde_macros = "0.6"
 uuid = "0.1"
+
+[dev-dependencies]
+crossbeam = "0.2"
