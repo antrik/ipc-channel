@@ -136,11 +136,21 @@ impl UnixSender {
         }
 
         unsafe {
+            let iovec = &mut [
+                iovec {
+                    iov_base: len_buffer.as_ptr() as *const c_char as *mut c_char,
+                    iov_len: len_buffer.len() as size_t,
+                },
+                iovec {
+                    iov_base: data.as_ptr() as *const c_char as *mut c_char,
+                    iov_len: data.len() as size_t,
+                }
+            ];
+
             unsafe fn construct_header(channels: &[UnixChannel],
                                        shared_memory_regions: &[UnixSharedMemory],
-                                       data_buffer: &[u8],
-                                       len_buffer: &[u8])
-                                       -> (msghdr, Box<[iovec]>) {
+                                       iovec: &mut [iovec])
+                                       -> msghdr {
                 let cmsg_length =
                     (channels.len() + shared_memory_regions.len()) * mem::size_of::<c_int>();
                 let cmsg_buffer = libc::malloc(CMSG_SPACE(cmsg_length as size_t)) as *mut cmsghdr;
@@ -168,19 +178,7 @@ impl UnixSender {
                     cmsg_padding_ptr = cmsg_padding_ptr.offset(1);
                 }
 
-                // Put this on the heap so address remains stable across function return.
-                let mut iovec = Box::new([
-                    iovec {
-                        iov_base: len_buffer.as_ptr() as *const c_char as *mut c_char,
-                        iov_len: len_buffer.len() as size_t,
-                    },
-                    iovec {
-                        iov_base: data_buffer.as_ptr() as *const c_char as *mut c_char,
-                        iov_len: data_buffer.len() as size_t,
-                    }
-                ]);
-
-                let msghdr = msghdr {
+                msghdr {
                     msg_name: ptr::null_mut(),
                     msg_namelen: 0,
                     msg_iov: iovec.as_mut_ptr(),
@@ -188,15 +186,10 @@ impl UnixSender {
                     msg_control: cmsg_buffer as *mut c_void,
                     msg_controllen: CMSG_SPACE(cmsg_length as size_t),
                     msg_flags: 0,
-                };
-
-                // Be sure to always return iovec -- whether the caller uses it or not --
-                // to prevent premature deallocation!
-                (msghdr, iovec)
+                }
             };
 
-            let (msghdr, _iovec) = construct_header(&channels, &shared_memory_regions,
-                                                    data, &len_buffer);
+            let msghdr = construct_header(&channels, &shared_memory_regions, iovec);
 
             let result = sendmsg(self.fd, &msghdr, 0);
             libc::free(msghdr.msg_control);
@@ -228,8 +221,7 @@ impl UnixSender {
             // along any other file descriptors that are to be transferred in the message.
             let (dedicated_tx, dedicated_rx) = try!(channel());
             channels.push(UnixChannel::Receiver(dedicated_rx));
-            let (msghdr, mut iovec) = construct_header(&channels, &shared_memory_regions,
-                                                       data, &len_buffer);
+            let msghdr = construct_header(&channels, &shared_memory_regions, iovec);
 
             let bytes_per_fragment = maximum_send_size - (len_buffer.len() +
                 msghdr.msg_controllen as usize + 256);
