@@ -8,14 +8,14 @@
 // except according to those terms.
 
 use bincode::serde::DeserializeError;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use libc::{self, MAP_SHARED, PROT_READ, PROT_WRITE, c_char, c_int, c_short, c_ulong};
 use libc::{c_ushort, c_void, mode_t, off_t, size_t, sockaddr, sockaddr_un, socklen_t, ssize_t};
 use std::cmp;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Debug, Formatter};
-use std::io::{Error, Write};
+use std::io::Error;
 use std::mem;
 use std::ops::Deref;
 use std::ptr;
@@ -177,19 +177,13 @@ impl UnixSender {
             fds.push(shared_memory_region.fd);
         }
 
-        let mut data_buffer = vec![0; data.len() + mem::size_of::<usize>()];
-        {
-            let mut data_buffer = &mut data_buffer[..];
-            // Message begins with a header recording the total data length.
-            //
-            // The receiver uses this to determine whether it already got the entire message,
-            // or needs to receive additional fragments.
-            data_buffer.write_uint::<LittleEndian>(data.len() as u64, mem::size_of::<usize>())
-                       .unwrap();
-            data_buffer.write(data).unwrap();
-        }
-
-        fn send_first_fragment(sender_fd: c_int, fds: &[c_int], data_buffer: &[u8])
+        // `len` is the total length of the message.
+        // Its value will be sent as a message header before the payload data.
+        //
+        // Not to be confused with the length of the data to send in this packet
+        // (i.e. the length of the data buffer passed in),
+        // which in a fragmented send will be smaller than the total message length.
+        fn send_first_fragment(sender_fd: c_int, fds: &[c_int], data_buffer: &[u8], len: usize)
                                -> Result<(),UnixError> {
             let result = unsafe {
                 let cmsg_length = mem::size_of_val(fds);
@@ -202,17 +196,27 @@ impl UnixSender {
                                          cmsg_buffer.offset(1) as *mut _ as *mut c_int,
                                          fds.len());
 
-                // Put this on the heap so address remains stable across function return.
-                let mut iovec = Box::new(iovec {
-                    iov_base: data_buffer.as_ptr() as *const c_char as *mut c_char,
-                    iov_len: data_buffer.len(),
-                });
+                let mut iovec = [
+                    iovec {
+                        // First fragment begins with a header recording the total data length.
+                        //
+                        // The receiver uses this to determine
+                        // whether it already got the entire message,
+                        // or needs to receive additional fragments.
+                        iov_base: &len as *const _ as *mut c_char,
+                        iov_len: mem::size_of_val(&len),
+                    },
+                    iovec {
+                        iov_base: data_buffer.as_ptr() as *const c_char as *mut c_char,
+                        iov_len: data_buffer.len(),
+                    }
+                ];
 
                 let msghdr = msghdr {
                     msg_name: ptr::null_mut(),
                     msg_namelen: 0,
-                    msg_iov: &mut *iovec,
-                    msg_iovlen: 1,
+                    msg_iov: iovec.as_mut_ptr(),
+                    msg_iovlen: iovec.len(),
                     msg_control: cmsg_buffer as *mut c_void,
                     msg_controllen: CMSG_SPACE(cmsg_length),
                     msg_flags: 0,
@@ -247,7 +251,7 @@ impl UnixSender {
 
         let mut downsize = false;
 
-        match send_first_fragment(self.fd, &fds[..], &data_buffer[..]) {
+        match send_first_fragment(self.fd, &fds[..], data, data.len()) {
             Ok(_) => return Ok(()),
             Err(error) => match error.0 {
                 libc::EMSGSIZE => {}, // Proceed to fragmented send.
@@ -289,19 +293,17 @@ impl UnixSender {
             let bytes_per_fragment = Self::fragment_size(sendbuf_size);
 
             let end_byte_position = cmp::min(data.len(), byte_position + bytes_per_fragment);
+            let bytes_to_send = end_byte_position - byte_position;
 
-            let bytes_to_send;
             let result = if byte_position == 0 {
                 // First fragment. No offset; but contains message header (total size).
                 // The auxillary data (FDs) is also sent along with this one.
 
-                bytes_to_send = end_byte_position + mem::size_of::<usize>();
-                send_first_fragment(self.fd, &fds[..], &data_buffer[..bytes_to_send])
+                send_first_fragment(self.fd, &fds[..], &data[..bytes_to_send], data.len())
             } else {
                 // Followup fragment. No header; but offset by amount of data already sent.
 
-                bytes_to_send = end_byte_position - byte_position;
-                let remainder = &data_buffer[byte_position + mem::size_of::<usize>() ..];
+                let remainder = &data[byte_position..];
                 send_followup_fragment(dedicated_tx.fd, &remainder[..bytes_to_send])
             };
 
