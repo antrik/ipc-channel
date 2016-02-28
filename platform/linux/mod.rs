@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Debug, Formatter};
 use std::fs::File;
-use std::io::{Error, Write};
+use std::io::Error;
 use std::mem;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
@@ -124,23 +124,23 @@ impl UnixSender {
                 mut channels: Vec<UnixChannel>,
                 shared_memory_regions: Vec<UnixSharedMemory>)
                 -> Result<(),UnixError> {
-        let mut data_buffer = vec![0; data.len() + mem::size_of::<usize>()];
+        // Message begins with a header containing the total data length.
+        //
+        // The receiver uses this to determine whether it already got the entire message,
+        // or needs to receive additional fragments.
+        let mut len_buffer = vec![0; mem::size_of::<usize>()];
         {
-            let mut data_buffer = &mut data_buffer[..];
-            // Message begins with a header containing the total data length.
-            //
-            // The receiver uses this to determine whether it already got the entire message,
-            // or needs to receive additional fragments.
-            data_buffer.write_uint::<LittleEndian>(data.len() as u64, mem::size_of::<usize>())
+            let mut len_buffer = &mut len_buffer[..];
+            len_buffer.write_uint::<LittleEndian>(data.len() as u64, mem::size_of::<usize>())
                        .unwrap();
-            data_buffer.write(data).unwrap();
         }
 
         unsafe {
             unsafe fn construct_header(channels: &[UnixChannel],
                                        shared_memory_regions: &[UnixSharedMemory],
-                                       data_buffer: &[u8])
-                                       -> (msghdr, Box<iovec>) {
+                                       data_buffer: &[u8],
+                                       len_buffer: &[u8])
+                                       -> (msghdr, Box<[iovec]>) {
                 let cmsg_length =
                     (channels.len() + shared_memory_regions.len()) * mem::size_of::<c_int>();
                 let cmsg_buffer = libc::malloc(CMSG_SPACE(cmsg_length as size_t)) as *mut cmsghdr;
@@ -169,16 +169,22 @@ impl UnixSender {
                 }
 
                 // Put this on the heap so address remains stable across function return.
-                let mut iovec = Box::new(iovec {
-                    iov_base: data_buffer.as_ptr() as *const c_char as *mut c_char,
-                    iov_len: data_buffer.len() as size_t,
-                });
+                let mut iovec = Box::new([
+                    iovec {
+                        iov_base: len_buffer.as_ptr() as *const c_char as *mut c_char,
+                        iov_len: len_buffer.len() as size_t,
+                    },
+                    iovec {
+                        iov_base: data_buffer.as_ptr() as *const c_char as *mut c_char,
+                        iov_len: data_buffer.len() as size_t,
+                    }
+                ]);
 
                 let msghdr = msghdr {
                     msg_name: ptr::null_mut(),
                     msg_namelen: 0,
-                    msg_iov: &mut *iovec,
-                    msg_iovlen: 1,
+                    msg_iov: iovec.as_mut_ptr(),
+                    msg_iovlen: iovec.len(),
                     msg_control: cmsg_buffer as *mut c_void,
                     msg_controllen: CMSG_SPACE(cmsg_length as size_t),
                     msg_flags: 0,
@@ -189,7 +195,8 @@ impl UnixSender {
                 (msghdr, iovec)
             };
 
-            let (msghdr, _iovec) = construct_header(&channels, &shared_memory_regions, &data_buffer);
+            let (msghdr, _iovec) = construct_header(&channels, &shared_memory_regions,
+                                                    data, &len_buffer);
 
             let result = sendmsg(self.fd, &msghdr, 0);
             libc::free(msghdr.msg_control);
@@ -221,33 +228,31 @@ impl UnixSender {
             // along any other file descriptors that are to be transferred in the message.
             let (dedicated_tx, dedicated_rx) = try!(channel());
             channels.push(UnixChannel::Receiver(dedicated_rx));
-            let (msghdr, mut iovec) = construct_header(&channels, &shared_memory_regions, &data_buffer);
+            let (msghdr, mut iovec) = construct_header(&channels, &shared_memory_regions,
+                                                       data, &len_buffer);
 
-            let bytes_per_fragment = maximum_send_size - (mem::size_of::<usize>() +
+            let bytes_per_fragment = maximum_send_size - (len_buffer.len() +
                 msghdr.msg_controllen as usize + 256);
 
             // Split up the packet into fragments.
             let mut byte_position = 0;
             while byte_position < data.len() {
                 let end_byte_position = cmp::min(data.len(), byte_position + bytes_per_fragment);
+                let bytes_to_send = end_byte_position - byte_position;
 
                 let result = if byte_position == 0 {
                     // First one. This fragment includes the message header (i.e. total size),
                     // as well as the file descriptors.
-                    let bytes_to_send = end_byte_position - byte_position + mem::size_of::<usize>();
 
                     // We can reuse the original buffer --
                     // just limit the size of the data actually sent.
-                    iovec.iov_len = bytes_to_send as size_t;
+                    iovec[1].iov_len = bytes_to_send as size_t;
 
                     sendmsg(self.fd, &msghdr, 0)
                 } else {
                     // Trailing fragment.
-                    let bytes_to_send = end_byte_position - byte_position;
-
                     libc::send(dedicated_tx.fd,
-                               data_buffer[mem::size_of::<usize>() + byte_position ..]
-                                   .as_ptr() as *const c_void,
+                               data[byte_position..].as_ptr() as *const c_void,
                                bytes_to_send as size_t,
                                0)
                 };
