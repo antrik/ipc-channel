@@ -22,7 +22,6 @@ use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{ATOMIC_USIZE_INIT, AtomicUsize, Ordering};
 use std::thread;
 
 #[cfg(all(any(target_arch="arm", target_arch="x86"), target_os="android"))]
@@ -31,8 +30,6 @@ const DEV_NULL_RDEV: libc::c_ulonglong = 0x0103;
 const DEV_NULL_RDEV: libc::dev_t = 0x0103;
 
 const MAX_FDS_IN_CMSG: u32 = 64;
-
-static LAST_FRAGMENT_ID: AtomicUsize = ATOMIC_USIZE_INIT;
 
 lazy_static! {
     static ref DEV_NULL: c_int = open_dev_null();
@@ -127,11 +124,15 @@ impl UnixSender {
                 mut channels: Vec<UnixChannel>,
                 shared_memory_regions: Vec<UnixSharedMemory>)
                 -> Result<(),UnixError> {
-        let mut data_buffer = vec![0; data.len() + mem::size_of::<u32>() * 2];
+        let mut data_buffer = vec![0; data.len() + mem::size_of::<usize>()];
         {
             let mut data_buffer = &mut data_buffer[..];
-            data_buffer.write_u32::<LittleEndian>(0u32).unwrap();
-            data_buffer.write_u32::<LittleEndian>(0u32).unwrap();
+            // Message begins with a header containing the total data length.
+            //
+            // The receiver uses this to determine whether it already got the entire message,
+            // or needs to receive additional fragments.
+            data_buffer.write_uint::<LittleEndian>(data.len() as u64, mem::size_of::<usize>())
+                       .unwrap();
             data_buffer.write(data).unwrap();
         }
 
@@ -222,41 +223,31 @@ impl UnixSender {
             channels.push(UnixChannel::Receiver(dedicated_rx));
             let (msghdr, mut iovec) = construct_header(&channels, &shared_memory_regions, &data_buffer);
 
-            let bytes_per_fragment = maximum_send_size - (mem::size_of::<u32>() * 2 +
+            let bytes_per_fragment = maximum_send_size - (mem::size_of::<usize>() +
                 msghdr.msg_controllen as usize + 256);
 
             // Split up the packet into fragments.
             let mut byte_position = 0;
-            let mut this_fragment_id = 0;
             while byte_position < data.len() {
                 let end_byte_position = cmp::min(data.len(), byte_position + bytes_per_fragment);
-                let next_fragment_id = if end_byte_position == data.len() {
-                    0
-                } else {
-                    (LAST_FRAGMENT_ID.fetch_add(1, Ordering::SeqCst) + 1) as u32
-                };
 
-                {
-                    let mut data_buffer = &mut data_buffer[..];
-                    data_buffer.write_u32::<LittleEndian>(this_fragment_id).unwrap();
-                    data_buffer.write_u32::<LittleEndian>(next_fragment_id).unwrap();
-                    data_buffer.write(&data[byte_position..end_byte_position]).unwrap();
-                }
-
-                let bytes_to_send = end_byte_position - byte_position + mem::size_of::<u32>() * 2;
                 let result = if byte_position == 0 {
-                    // First one. This fragment includes the file descriptors.
+                    // First one. This fragment includes the message header (i.e. total size),
+                    // as well as the file descriptors.
+                    let bytes_to_send = end_byte_position - byte_position + mem::size_of::<usize>();
 
-                    // Better reset this in case `data_buffer` moved around -- iterator
-                    // invalidation!
-                    iovec.iov_base = data_buffer.as_ptr() as *const c_char as *mut c_char;
+                    // We can reuse the original buffer --
+                    // just limit the size of the data actually sent.
                     iovec.iov_len = bytes_to_send as size_t;
 
                     sendmsg(self.fd, &msghdr, 0)
                 } else {
                     // Trailing fragment.
+                    let bytes_to_send = end_byte_position - byte_position;
+
                     libc::send(dedicated_tx.fd,
-                               data_buffer.as_ptr() as *const c_void,
+                               data_buffer[mem::size_of::<usize>() + byte_position ..]
+                                   .as_ptr() as *const c_void,
                                bytes_to_send as size_t,
                                0)
                 };
@@ -267,7 +258,6 @@ impl UnixSender {
                 }
 
                 byte_position += bytes_per_fragment;
-                this_fragment_id = next_fragment_id;
             }
 
             libc::free(msghdr.msg_control);
@@ -697,18 +687,15 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
             shared_memory_regions.push(UnixSharedMemory::from_fd(fd));
         }
 
-        // Separate out the fragmentation frame.
-        let (fragment_info_buffer, main_data_buffer) = cmsg.data_buffer
-                                                           .split_at(mem::size_of::<u32>() * 2);
+        // Separate out the header.
+        let (header, main_data_buffer) = cmsg.data_buffer.split_at(mem::size_of::<usize>());
         let mut main_data_buffer: Vec<u8> =
-            main_data_buffer[0..(bytes_read - mem::size_of::<u32>() * 2)].iter()
-                                                                         .cloned()
-                                                                         .collect();
-        let mut next_fragment_id =
-            (&fragment_info_buffer[mem::size_of::<u32>()..
-                                   (mem::size_of::<u32>() * 2)]).read_u32::<LittleEndian>()
-                                                                .unwrap();
-        if next_fragment_id == 0 {
+            main_data_buffer[0..(bytes_read - mem::size_of::<usize>())].iter()
+                                                                       .cloned()
+                                                                       .collect();
+        let total_size = (&header[..]).read_uint::<LittleEndian>(mem::size_of::<usize>())
+                                      .unwrap() as usize;
+        if total_size == main_data_buffer.len() {
             // Fast path: no fragments.
             return Ok((main_data_buffer, channels, shared_memory_regions))
         }
@@ -718,23 +705,15 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
         // The initial fragment carries the receive end of a dedicated channel
         // through which all the remaining fragments will be coming in.
         let dedicated_rx = channels.pop().unwrap().to_receiver();
-        while next_fragment_id != 0 {
+        while main_data_buffer.len() < total_size {
             let mut cmsg = UnixCmsg::new(maximum_recv_size);
             // Always use blocking mode for followup fragments,
             // to make sure that once we start receiving a multi-fragment message,
             // we don't abort in the middle of it...
             let bytes_read = try!(cmsg.recv(dedicated_rx.fd, BlockingMode::Blocking)) as usize;
 
-            let this_fragment_id =
-                (&cmsg.data_buffer[0..mem::size_of::<u32>()]).read_u32::<LittleEndian>().unwrap();
-            assert!(this_fragment_id == next_fragment_id);
-
-            next_fragment_id =
-                (&cmsg.data_buffer[mem::size_of::<u32>()..
-                                   (mem::size_of::<u32>() * 2)]).read_u32::<LittleEndian>()
-                                                                .unwrap();
-            main_data_buffer.extend(
-                    cmsg.data_buffer[(mem::size_of::<u32>() * 2)..bytes_read].iter().cloned())
+            // Followup fragemnts do not have a header -- the entire buffer is payload.
+            main_data_buffer.extend_from_slice(&cmsg.data_buffer[0..bytes_read]);
         }
 
         Ok((main_data_buffer, channels, shared_memory_regions))
