@@ -224,7 +224,7 @@ impl UnixSender {
             let msghdr = construct_header(&channels, &shared_memory_regions, iovec);
 
             let bytes_per_fragment = maximum_send_size - (len_buffer.len() +
-                msghdr.msg_controllen as usize + 256);
+                msghdr.msg_controllen as usize + 0);
 
             // Split up the packet into fragments.
             let mut byte_position = 0;
@@ -787,7 +787,7 @@ impl UnixCmsg {
         let cmsg_length = mem::size_of::<cmsghdr>() + (MAX_FDS_IN_CMSG as usize) *
             mem::size_of::<c_int>();
         assert!(maximum_recv_size > cmsg_length);
-        let data_length = maximum_recv_size - cmsg_length;
+        let data_length = maximum_recv_size;
         let mut data_buffer: Vec<u8> = vec![0; data_length];
         let cmsg_buffer = libc::malloc(cmsg_length as size_t) as *mut cmsghdr;
         let mut iovec = Box::new(iovec {
@@ -883,7 +883,7 @@ type nfds_t = c_ulong;
 
 #[allow(non_snake_case)]
 fn CMSG_LEN(length: size_t) -> size_t {
-    CMSG_ALIGN((mem::size_of::<cmsghdr>() as size_t) + length)
+    CMSG_ALIGN(mem::size_of::<cmsghdr>() as size_t) + length
 }
 
 #[allow(non_snake_case)]
