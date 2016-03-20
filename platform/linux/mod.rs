@@ -202,7 +202,7 @@ impl UnixSender {
                         //
                         // The receiver uses this to determine
                         // whether it already got the entire message,
-                        // or needs to receive additional fragments.
+                        // or needs to receive additional fragments -- and if so, how much.
                         iov_base: &len as *const _ as *mut c_char,
                         iov_len: mem::size_of_val(&len),
                     },
@@ -764,15 +764,32 @@ fn recv(fd: c_int, blocking_mode: BlockingMode)
         // The initial fragment carries the receive end of a dedicated channel
         // through which all the remaining fragments will be coming in.
         let dedicated_rx = channels.pop().unwrap().to_receiver();
-        while main_data_buffer.len() < total_size {
-            let mut cmsg = UnixCmsg::new(maximum_recv_size);
-            // Always use blocking mode for followup fragments,
-            // to make sure that once we start receiving a multi-fragment message,
-            // we don't abort in the middle of it...
-            let bytes_read = try!(cmsg.recv(dedicated_rx.fd, BlockingMode::Blocking));
 
-            // Followup fragemnts do not have a header -- the entire buffer is payload.
-            main_data_buffer.extend_from_slice(&cmsg.data_buffer[0..bytes_read]);
+        let mut write_pos = main_data_buffer.len();
+        // Extend the buffer to hold the entire message, without initialising the memory.
+        main_data_buffer.reserve(total_size - write_pos);
+        main_data_buffer.set_len(total_size);
+
+        // Receive followup fragments directly into the main buffer.
+        while write_pos < total_size {
+            let end_pos = cmp::min(write_pos + maximum_recv_size, total_size);
+            let bytes_read = {
+                // Note: we always use blocking mode for followup fragments,
+                // to make sure that once we start receiving a multi-fragment message,
+                // we don't abort in the middle of it...
+                let result = libc::recv(dedicated_rx.fd,
+                                        main_data_buffer[write_pos..].as_mut_ptr() as *mut c_void,
+                                        end_pos - write_pos,
+                                        0);
+                if result > 0 {
+                    result as usize
+                } else if result == 0 {
+                    return Err(UnixError(libc::ECONNRESET))
+                } else {
+                    return Err(UnixError::last())
+                }
+            };
+            write_pos += bytes_read;
         }
 
         Ok((main_data_buffer, channels, shared_memory_regions))
