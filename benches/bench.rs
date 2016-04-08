@@ -28,7 +28,7 @@ macro_rules! create_bench_for_size {
             let (wait_tx, wait_rx) = mpsc::channel();
             let wait_rx = Mutex::new(wait_rx);
 
-            if $size > tx.get_max_fragment_size().unwrap() {
+            if $size > platform::OsIpcSender::get_max_fragment_size() {
                 b.iter(|| {
                     crossbeam::scope(|scope| {
                         scope.spawn(|| {

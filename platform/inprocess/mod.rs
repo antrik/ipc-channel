@@ -149,7 +149,7 @@ impl MpscSender {
         Ok(record.sender)
     }
 
-    pub fn get_max_fragment_size(&self) -> Result<usize,()> {
+    pub fn get_max_fragment_size() -> usize {
         Ok(usize::MAX)
     }
 
