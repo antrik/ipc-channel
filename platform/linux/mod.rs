@@ -303,18 +303,22 @@ impl UnixSender {
                 sendbuf_size /= 2;
                 downsize = false;
             }
-            let bytes_per_fragment = Self::fragment_size(sendbuf_size);
 
-            let end_byte_position = cmp::min(data.len(), byte_position + bytes_per_fragment);
-            let bytes_to_send = end_byte_position - byte_position;
-
+            let bytes_to_send;
             let result = if byte_position == 0 {
                 // First fragment. No offset; but contains message header (total size).
                 // The auxillary data (FDs) is also sent along with this one.
 
+                bytes_to_send = Self::fragment_size(sendbuf_size);
                 send_first_fragment(self.fd, &fds[..], &data[..bytes_to_send], data.len())
             } else {
-                // Followup fragment. No header; but offset by amount of data already sent.
+                // Followup fragment. Sent over dedicated channel;
+                // and can use the entire packet size for main data.
+                //
+                // Might not fill the entire packet size, if it's the tail fragment.
+                let fragment_size = *SYSTEM_SENDBUF_SIZE - RESERVED_SIZE;
+                let end_byte_position = cmp::min(data.len(), byte_position + fragment_size);
+                bytes_to_send = end_byte_position - byte_position;
 
                 let remainder = &data[byte_position..];
                 send_followup_fragment(dedicated_tx.fd, &remainder[..bytes_to_send])
@@ -339,7 +343,7 @@ impl UnixSender {
                 }
             }
 
-            byte_position += bytes_per_fragment;
+            byte_position += bytes_to_send;
         }
 
         Ok(())
