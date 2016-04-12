@@ -257,7 +257,6 @@ impl UnixSender {
             let (dedicated_tx, dedicated_rx) = try!(channel());
             // Extract FD handle without consuming the Receiver, so the FD doesn't get closed.
             fds.push(dedicated_rx.fd);
-            let (msghdr, mut iovec) = construct_header(&fds[..], &data_buffer[..]);
 
             // Split up the packet into fragments.
             let mut sendbuf_size = try!(self.get_system_sendbuf_size());
@@ -289,12 +288,12 @@ impl UnixSender {
                 let result = if byte_position == 0 {
                     // First one. This fragment includes the file descriptors.
 
-                    // Better reset this in case `data_buffer` moved around -- iterator
-                    // invalidation!
-                    iovec.iov_base = data_buffer.as_ptr() as *const c_char as *mut c_char;
-                    iovec.iov_len = bytes_to_send;
+                    let (msghdr, _iovec) = construct_header(&fds[..],
+                                                            &data_buffer[..bytes_to_send]);
 
-                    sendmsg(self.fd, &msghdr, 0)
+                    let result = sendmsg(self.fd, &msghdr, 0);
+                    libc::free(msghdr.msg_control);
+                    result
                 } else {
                     // Trailing fragment.
                     libc::send(dedicated_tx.fd,
@@ -317,7 +316,6 @@ impl UnixSender {
                         downsize = true;
                         continue
                     } else {
-                        libc::free(msghdr.msg_control);
                         return Err(error)
                     }
                 }
@@ -326,7 +324,6 @@ impl UnixSender {
                 this_fragment_id = next_fragment_id;
             }
 
-            libc::free(msghdr.msg_control);
             Ok(())
         }
     }
