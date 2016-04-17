@@ -229,6 +229,21 @@ impl UnixSender {
             }
         };
 
+        fn send_followup_fragment(sender_fd: c_int, data_buffer: &[u8]) -> Result<(),UnixError> {
+            let result = unsafe {
+                libc::send(sender_fd,
+                           data_buffer.as_ptr() as *const c_void,
+                           data_buffer.len(),
+                           0)
+            };
+
+            if result > 0 {
+                Ok(())
+            } else {
+                Err(UnixError::last())
+            }
+        }
+
         unsafe {
             let mut downsize = false;
 
@@ -293,22 +308,14 @@ impl UnixSender {
                 let result = if byte_position == 0 {
                     send_first_fragment(self.fd, &fds[..], &data_buffer[..bytes_to_send])
                 } else {
-                    // Trailing fragment.
-                    let result = libc::send(dedicated_tx.fd,
-                                            data_buffer.as_ptr() as *const c_void,
-                                            bytes_to_send,
-                                            0);
-                    if result > 0 {
-                        Ok(())
-                    } else {
-                        Err(UnixError::last())
-                    }
+                    send_followup_fragment(dedicated_tx.fd, &data_buffer[..bytes_to_send])
                 };
 
                 if let Err(error) = result {
                     match error.0 {
                         libc::ENOBUFS if bytes_to_send > 2000 => {
-                            // If the kernel failed to allocate a buffer large enough for the packet,
+                            // If the kernel failed to allocate a buffer
+                            // large enough for the packet,
                             // retry with a smaller size.
                             //
                             // (If the packet was already significantly smaller
