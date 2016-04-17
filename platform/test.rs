@@ -212,19 +212,10 @@ macro_rules! create_with_n_fds {
 #[cfg(target_os="linux")]
 mod fragment_tests {
     use platform::{self, OsIpcChannel};
-    use std::mem;
 
     lazy_static! {
         static ref FRAGMENT_SIZE: usize = {
-            // Should be the biggest size that just fits in a single packet.
-            //
-            // 32 is the empirical size reseved by the kernel;
-            // the rest is for the fragment header.
-            //
-            // Note that this calculation might become imprecise
-            // when certain implementation details of the send() method change...
-            platform::channel().and_then(|(tx, _)| tx.get_system_sendbuf_size()).unwrap()
-                - 32 - mem::size_of::<u32>() * 2
+            platform::channel().and_then(|(tx, _)| tx.get_max_fragment_size()).unwrap()
         };
     }
 
