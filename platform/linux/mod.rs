@@ -188,8 +188,9 @@ impl UnixSender {
             data_buffer.write(data).unwrap();
         }
 
-        unsafe {
-            unsafe fn construct_header(fds: &[c_int], data_buffer: &[u8]) -> (msghdr, Box<iovec>) {
+        fn send_first_fragment(sender_fd: c_int, fds: &[c_int], data_buffer: &[u8])
+                               -> Result<(),UnixError> {
+            let result = unsafe {
                 let cmsg_length = mem::size_of_val(fds);
                 let cmsg_buffer = libc::malloc(CMSG_SPACE(cmsg_length)) as *mut cmsghdr;
                 (*cmsg_buffer).cmsg_len = CMSG_LEN(cmsg_length);
@@ -216,35 +217,38 @@ impl UnixSender {
                     msg_flags: 0,
                 };
 
-                // Be sure to always return iovec -- whether the caller uses it or not --
-                // to prevent premature deallocation!
-                (msghdr, iovec)
+                let result = sendmsg(sender_fd, &msghdr, 0);
+                libc::free(cmsg_buffer as *mut c_void);
+                result
             };
 
-            let (msghdr, _iovec) = construct_header(&fds[..], &data_buffer[..]);
+            if result > 0 {
+                Ok(())
+            } else {
+                Err(UnixError::last())
+            }
+        };
 
-            let result = sendmsg(self.fd, &msghdr, 0);
-            libc::free(msghdr.msg_control);
-
+        unsafe {
             let mut downsize = false;
 
-            if result > 0 {
-                return Ok(())
-            } else {
-                let error = UnixError::last();
-                if error.0 == libc::ENOBUFS {
-                    // If we get this error,
-                    // it means the message was small enough to fit the maximum send size,
-                    // but the kernel failed to allocate a buffer large enough
-                    // to actually transfer the message --
-                    // so we have to proceed with a fragmented send nevertheless.
-                    //
-                    // The flag indicates that packets need to be smaller
-                    // than the ordinary maximum send size.
-                    downsize = true;
-                } else if error.0 != libc::EMSGSIZE {
-                    return Err(error)
-                }
+            match send_first_fragment(self.fd, &fds[..], &data_buffer[..]) {
+                Ok(_) => return Ok(()),
+                Err(error) => match error.0 {
+                    libc::EMSGSIZE => {}, // Proceed to fragmented send.
+                    libc::ENOBUFS => {
+                        // If we get this error,
+                        // it means the message was small enough to fit the maximum send size,
+                        // but the kernel failed to allocate a buffer large enough
+                        // to actually transfer the message --
+                        // so we have to proceed with a fragmented send nevertheless.
+                        //
+                        // The flag indicates that packets need to be smaller
+                        // than the ordinary maximum send size.
+                        downsize = true;
+                    },
+                    _ => return Err(error),
+                },
             }
 
             // The packet is too big. Fragmentation time!
@@ -285,38 +289,37 @@ impl UnixSender {
                 }
 
                 let bytes_to_send = end_byte_position - byte_position + mem::size_of::<u32>() * 2;
+
                 let result = if byte_position == 0 {
-                    // First one. This fragment includes the file descriptors.
-
-                    let (msghdr, _iovec) = construct_header(&fds[..],
-                                                            &data_buffer[..bytes_to_send]);
-
-                    let result = sendmsg(self.fd, &msghdr, 0);
-                    libc::free(msghdr.msg_control);
-                    result
+                    send_first_fragment(self.fd, &fds[..], &data_buffer[..bytes_to_send])
                 } else {
                     // Trailing fragment.
-                    libc::send(dedicated_tx.fd,
-                               data_buffer.as_ptr() as *const c_void,
-                               bytes_to_send,
-                               0)
+                    let result = libc::send(dedicated_tx.fd,
+                                            data_buffer.as_ptr() as *const c_void,
+                                            bytes_to_send,
+                                            0);
+                    if result > 0 {
+                        Ok(())
+                    } else {
+                        Err(UnixError::last())
+                    }
                 };
 
-                if result <= 0 {
-                    let error = UnixError::last();
-                    if error.0 == libc::ENOBUFS && bytes_to_send > 2000 {
-                        // If the kernel failed to allocate a buffer large enough for the packet,
-                        // retry with a smaller size.
-                        //
-                        // (If the packet was already significantly smaller
-                        // than the memory page size though,
-                        // if means something else must have gone wrong;
-                        // so there is no point in further downsizing,
-                        // and we error out instead.)
-                        downsize = true;
-                        continue
-                    } else {
-                        return Err(error)
+                if let Err(error) = result {
+                    match error.0 {
+                        libc::ENOBUFS if bytes_to_send > 2000 => {
+                            // If the kernel failed to allocate a buffer large enough for the packet,
+                            // retry with a smaller size.
+                            //
+                            // (If the packet was already significantly smaller
+                            // than the memory page size though,
+                            // if means something else must have gone wrong;
+                            // so there is no point in further downsizing,
+                            // and we error out instead.)
+                            downsize = true;
+                            continue
+                        },
+                        _ => return Err(error),
                     }
                 }
 
