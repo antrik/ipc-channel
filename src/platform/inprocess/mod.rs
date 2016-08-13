@@ -18,6 +18,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::cmp::{PartialEq};
 use std::ops::Deref;
 use std::mem;
+use std::thread;
 use std::usize;
 
 use uuid::Uuid;
@@ -262,6 +263,19 @@ pub struct OsIpcOneShotServer {
     name: String,
 }
 
+impl Drop for OsIpcOneShotServer {
+    fn drop(&mut self) {
+        let lock = if thread::panicking() {
+            ONE_SHOT_SERVERS.try_lock()
+        } else {
+            ONE_SHOT_SERVERS.lock().map_err(|err| err.into())
+        };
+        if let Ok(mut servers) = lock {
+            servers.remove(&self.name);
+        }
+    }
+}
+
 impl OsIpcOneShotServer {
     pub fn new() -> Result<(OsIpcOneShotServer, String),MpscError> {
         let (sender, receiver) = match channel() {
@@ -285,7 +299,6 @@ impl OsIpcOneShotServer {
     {
         let record = ONE_SHOT_SERVERS.lock().unwrap().get(&self.name).unwrap().clone();
         record.accept();
-        ONE_SHOT_SERVERS.lock().unwrap().remove(&self.name).unwrap();
         let receiver = self.receiver.borrow_mut().take().unwrap();
         let (data, channels, shmems) = receiver.recv().unwrap();
         Ok((receiver, data, channels, shmems))
