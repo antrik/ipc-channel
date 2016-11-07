@@ -8,6 +8,7 @@ repository = "https://github.com/servo/ipc-channel"
 
 [features]
 force-inprocess = []
+unstable = ["compiletest_rs"]
 
 [dependencies]
 bincode = "0.6"
@@ -16,6 +17,10 @@ libc = "0.2.12"
 rand = "0.3"
 serde = "0.8"
 uuid = {version = "0.3", features = ["v4"]}
+
+# Since `compiletest` only works with unstable, and thus needs to be optional,
+# we can't put it in `dev-dependencies`...
+compiletest_rs = { version = "0.2", optional = true }
 
 [dev-dependencies]
 crossbeam = "0.2"
