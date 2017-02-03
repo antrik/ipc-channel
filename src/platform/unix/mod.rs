@@ -457,7 +457,12 @@ impl OsIpcReceiverSet {
         let last_index = self.incrementor.increment();
         let fd = receiver.consume_fd();
         let io = EventedFd(&fd);
-        let fd_token = Token(fd as usize);
+
+        let next_free = (0..usize::max_value())
+                        .find(|&i| !self.pollfds.contains_key(&Token(i)))
+                        .unwrap();
+        let fd_token = Token(next_free);
+
         let poll_entry = PollEntry {
             id: last_index,
             fd: fd
