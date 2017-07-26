@@ -648,15 +648,11 @@ fn server_connect_first() {
                (data, vec![], vec![]));
 }
 
-// Note! This test is actually used by the cross_process_spawn() test
-// below as a second process.  Running it by itself is meaningless, but
-// passes.
 #[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
 #[test]
-#[ignore]
-fn cross_process_server()
-{
+fn cross_process_spawn() {
     let data: &[u8] = b"1234567";
+
     let channel_name = get_channel_name_arg("server");
     if let Some(channel_name) = channel_name {
         let tx = OsIpcSender::connect(channel_name).unwrap();
@@ -664,15 +660,9 @@ fn cross_process_server()
 
         unsafe { libc::exit(0); }
     }
-}
 
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
-#[test]
-fn cross_process_spawn() {
     let (server, name) = OsIpcOneShotServer::new().unwrap();
-    let data: &[u8] = b"1234567";
-
-    let mut child_pid = spawn_server("cross_process_server", &[("server", &*name)]);
+    let mut child_pid = spawn_server("cross_process_spawn", &[("server", &*name)]);
 
     let (_, received_data, received_channels, received_shared_memory_regions) =
         server.accept().unwrap();
@@ -699,14 +689,9 @@ fn cross_process_fork() {
                (data, vec![], vec![]));
 }
 
-// Note! This test is actually used by the cross_process_sender_transfer_spawn() test
-// below as a second process.  Running it by itself is meaningless, but
-// passes.
 #[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
 #[test]
-#[ignore]
-fn cross_process_sender_transfer_server()
-{
+fn cross_process_sender_transfer_spawn() {
     let channel_name = get_channel_name_arg("server");
     if let Some(channel_name) = channel_name {
         let super_tx = OsIpcSender::connect(channel_name).unwrap();
@@ -719,15 +704,9 @@ fn cross_process_sender_transfer_server()
 
         unsafe { libc::exit(0); }
     }
-}
 
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
-#[test]
-fn cross_process_sender_transfer_spawn() {
     let (server, name) = OsIpcOneShotServer::new().unwrap();
-
-    let mut child_pid = spawn_server("cross_process_sender_transfer_server",
-                                     &[("server", &*name)]);
+    let mut child_pid = spawn_server("cross_process_sender_transfer_spawn", &[("server", &*name)]);
 
     let (super_rx, _, mut received_channels, _) = server.accept().unwrap();
     assert_eq!(received_channels.len(), 1);
@@ -937,15 +916,14 @@ mod sync_test {
     }
 }
 
-// Note! This test is actually used by the
-// cross_process_two_step_transfer_spawn() test below.  Running it by
-// itself is meaningless, but it passes if run this way.
+// TODO -- this fails on OSX with a MACH_SEND_INVALID_RIGHT!
+// Needs investigation.
 #[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
+#[cfg_attr(target_os = "macos", ignore)]
 #[test]
-#[ignore]
-fn cross_process_two_step_transfer_server()
-{
+fn cross_process_two_step_transfer_spawn() {
     let cookie: &[u8] = b"cookie";
+
     let channel_name = get_channel_name_arg("server");
     if let Some(channel_name) = channel_name {
         // connect by name to our other process
@@ -977,15 +955,6 @@ fn cross_process_two_step_transfer_server()
         // terminate
         unsafe { libc::exit(0); }
     }
-}
-
-// TODO -- this fails on OSX with a MACH_SEND_INVALID_RIGHT!
-// Needs investigation.
-#[cfg(not(any(feature = "force-inprocess", target_os = "windows", target_os = "android", target_os = "ios")))]
-#[cfg_attr(target_os = "macos", ignore)]
-#[test]
-fn cross_process_two_step_transfer_spawn() {
-    let cookie: &[u8] = b"cookie";
 
     // create channel 1
     let (one_tx, one_rx) = platform::channel().unwrap();
@@ -999,7 +968,7 @@ fn cross_process_two_step_transfer_spawn() {
 
     // create a one-shot server, and spawn another process
     let (server, name) = OsIpcOneShotServer::new().unwrap();
-    let mut child_pid = spawn_server("cross_process_two_step_transfer_server",
+    let mut child_pid = spawn_server("cross_process_two_step_transfer_spawn",
                                      &[("server", &*name)]);
 
     // The other process will have sent us a transmit channel in received channels
