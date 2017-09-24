@@ -258,7 +258,7 @@ fn dup_handle_to_process(handle: &WinHandle, other_process: &WinHandle) -> Resul
 }
 
 /// Duplicate a handle to the target process, closing the source handle.
-fn move_handle_to_process(handle: &mut WinHandle, other_process: &WinHandle) -> Result<WinHandle,WinError> {
+fn move_handle_to_process(mut handle: WinHandle, other_process: &WinHandle) -> Result<WinHandle,WinError> {
     unsafe {
         let h = try!(dup_handle_to_process_with_flags(
             handle.take(), **other_process,
@@ -1047,8 +1047,8 @@ impl OsIpcSender {
 
         for port in ports {
             match port {
-                OsIpcChannel::Sender(mut s) => {
-                    let mut raw_remote_handle = try!(move_handle_to_process(&mut s.handle, &server_h));
+                OsIpcChannel::Sender(s) => {
+                    let mut raw_remote_handle = try!(move_handle_to_process(s.handle, &server_h));
                     oob.channel_handles.push(raw_remote_handle.take() as intptr_t);
                 },
                 OsIpcChannel::Receiver(r) => {
@@ -1056,7 +1056,8 @@ impl OsIpcSender {
                         panic!("Sending receiver with outstanding partial read buffer, noooooo!  What should even happen?");
                     }
 
-                    let mut raw_remote_handle = try!(move_handle_to_process(&mut r.reader.into_inner().handle, &server_h));
+                    let handle = WinHandle::new(r.reader.into_inner().handle.take());
+                    let mut raw_remote_handle = try!(move_handle_to_process(handle, &server_h));
                     oob.channel_handles.push(raw_remote_handle.take() as intptr_t);
                 },
             }
@@ -1075,7 +1076,8 @@ impl OsIpcSender {
                 };
 
                 // Put the receiver in the OOB data
-                let mut raw_receiver_handle = try!(move_handle_to_process(&mut receiver.reader.into_inner().handle, &server_h));
+                let handle = WinHandle::new(receiver.reader.into_inner().handle.take());
+                let mut raw_receiver_handle = try!(move_handle_to_process(handle, &server_h));
                 oob.big_data_receiver_handle = Some((raw_receiver_handle.take() as intptr_t, data.len() as u64));
                 oob.target_process_id = server_pid;
 
