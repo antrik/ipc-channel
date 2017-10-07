@@ -1541,7 +1541,7 @@ impl OsOpaqueIpcChannel {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WinError {
     WindowsResult(u32),
     ChannelClosed,
@@ -1592,10 +1592,7 @@ impl WinError {
     }
 
     pub fn channel_is_closed(&self) -> bool {
-        match *self {
-            WinError::ChannelClosed => true,
-            _ => false,
-        }
+        *self == WinError::ChannelClosed
     }
 }
 
